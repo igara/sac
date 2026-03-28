@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "llm-cli-llama",
+]
+resolver = "2"
