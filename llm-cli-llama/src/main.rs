@@ -582,8 +582,171 @@ fn extract_urls(text: &str) -> Vec<String> {
     urls
 }
 
+/// HTML 文字列からテキストコンテンツを抽出する共通処理
+fn extract_text_from_html(html: &str) -> String {
+    let doc = Html::parse_document(html);
+    let sel = Selector::parse(
+        "p, h1, h2, h3, h4, h5, h6, li, td, th, blockquote, article",
+    )
+    .unwrap();
+    let mut lines: Vec<String> = doc
+        .select(&sel)
+        .map(|el| el.text().collect::<Vec<_>>().join(" "))
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|t| t.len() > 3)
+        .collect();
+    lines.dedup();
+    let text = lines.join("\n");
+    if text.len() > 8000 {
+        format!("{}…[truncated]", &text[..8000])
+    } else {
+        text
+    }
+}
+
+/// AppleScript で起動中の Chrome を操作してページ DOM を取得する（macOS のみ）
+/// 実際のセッション・Keychain 復号済み Cookie をそのまま使えるため認証が必要なページにも対応
+fn fetch_url_content_applescript(url: &str) -> anyhow::Result<String> {
+    // AppleScript インジェクション対策: URL 内の " と \ をエスケープ
+    let safe_url = url.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let script = format!(
+        r#"tell application "Google Chrome"
+    if (count of windows) = 0 then
+        make new window
+    end if
+    set newTab to make new tab at end of tabs of first window with properties {{URL:"{safe_url}"}}
+    set maxWait to 30
+    set waited to 0
+    repeat
+        delay 0.5
+        set waited to waited + 0.5
+        if loading of newTab is false then exit repeat
+        if waited > maxWait then exit repeat
+    end repeat
+    delay 1
+    set htmlContent to execute newTab javascript "document.documentElement.outerHTML"
+    close newTab
+    return htmlContent
+end tell"#
+    );
+
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("Failed to run AppleScript")?;
+
+    anyhow::ensure!(
+        output.status.success(),
+        "AppleScript failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let html = String::from_utf8_lossy(&output.stdout).into_owned();
+    anyhow::ensure!(!html.trim().is_empty(), "AppleScript returned empty content");
+    Ok(extract_text_from_html(&html))
+}
+
+/// ユーザーの Chrome プロファイルを一時ディレクトリにコピーして返す
+/// （起動中の Chrome と同じプロファイルを同時使用するとロックエラーになるため）
+fn prepare_chrome_profile() -> anyhow::Result<tempfile::TempDir> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let src = home.join("Library/Application Support/Google/Chrome");
+    anyhow::ensure!(src.exists(), "Chrome profile not found at {}", src.display());
+
+    let tmp = tempfile::tempdir().context("Failed to create temp directory")?;
+    let dst = tmp.path().join("chrome-profile");
+
+    let default_src = src.join("Default");
+    let default_dst = dst.join("Default");
+    std::fs::create_dir_all(&default_dst)?;
+
+    for filename in &["Cookies", "Login Data", "Web Data"] {
+        let from = default_src.join(filename);
+        if from.exists() {
+            std::fs::copy(&from, default_dst.join(filename)).ok();
+        }
+    }
+    let ls = src.join("LocalState");
+    if ls.exists() {
+        std::fs::copy(&ls, dst.join("LocalState")).ok();
+    }
+
+    Ok(tmp)
+}
+
+/// Chrome headless で URL を開いてレンダリング済み DOM を取得する（フォールバック用）
+fn fetch_url_content_chrome_headless(url: &str) -> anyhow::Result<String> {
+    let chrome_paths = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "google-chrome",
+        "chromium",
+    ];
+    let chrome = chrome_paths
+        .iter()
+        .find(|p| {
+            if p.starts_with('/') {
+                std::path::Path::new(p).exists()
+            } else {
+                std::process::Command::new("which")
+                    .arg(p)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("Chrome/Chromium not found"))?;
+
+    let _tmp_profile = prepare_chrome_profile().ok();
+    let user_data_dir_arg = _tmp_profile.as_ref().map(|tmp| {
+        format!("--user-data-dir={}", tmp.path().join("chrome-profile").display())
+    });
+
+    let mut args: Vec<&str> = vec![
+        "--headless=new",
+        "--dump-dom",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--timeout=15000",
+    ];
+    if let Some(ref dir_arg) = user_data_dir_arg {
+        args.push(dir_arg.as_str());
+    }
+    args.push(url);
+
+    let output = std::process::Command::new(chrome)
+        .args(&args)
+        .output()
+        .context("Failed to launch Chrome")?;
+
+    anyhow::ensure!(
+        output.status.success(),
+        "Chrome exited with status: {}",
+        output.status
+    );
+
+    let html = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(extract_text_from_html(&html))
+}
+
 /// URL を取得してテキストコンテンツを返す
+/// 優先順位: 1) AppleScript (Chrome起動中・完全セッション) → 2) headless Chrome → 3) ureq
 fn fetch_url_content(url: &str) -> anyhow::Result<String> {
+    // 1. AppleScript で起動中の Chrome を操作（ログイン済みセッションをそのまま使用）
+    match fetch_url_content_applescript(url) {
+        Ok(text) if !text.trim().is_empty() => return Ok(text),
+        _ => {} // Chrome 未起動 or AppleScript 失敗 → 次の手段へ
+    }
+
+    // 2. headless Chrome + プロファイルコピー
+    match fetch_url_content_chrome_headless(url) {
+        Ok(text) if !text.trim().is_empty() => return Ok(text),
+        _ => {}
+    }
+
+    // 3. フォールバック: ureq による通常フェッチ
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(15))
         .build();
@@ -597,28 +760,7 @@ fn fetch_url_content(url: &str) -> anyhow::Result<String> {
         .call()?
         .into_string()?;
 
-    let doc = Html::parse_document(&body);
-
-    // p / heading / li / td 等のコンテンツ要素からテキストを収集
-    let sel = Selector::parse(
-        "p, h1, h2, h3, h4, h5, h6, li, td, th, blockquote, article",
-    )
-    .unwrap();
-
-    let mut lines: Vec<String> = doc
-        .select(&sel)
-        .map(|el| el.text().collect::<Vec<_>>().join(" "))
-        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|t| t.len() > 3)
-        .collect();
-    lines.dedup();
-
-    let text = lines.join("\n");
-    Ok(if text.len() > 8000 {
-        format!("{}…[truncated]", &text[..8000])
-    } else {
-        text
-    })
+    Ok(extract_text_from_html(&body))
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -797,7 +939,7 @@ fn chat_session(model: &LlamaModel, backend: &LlamaBackend, args: &Args) -> Resu
         } else {
             let mut ctx_block = String::new();
             for url in &urls {
-                eprint!("\n[fetching {}] ", url);
+                eprint!("\n[fetching {} via Chrome] ", url);
                 io::stderr().flush()?;
                 match fetch_url_content(url) {
                     Ok(content) if !content.trim().is_empty() => {
@@ -808,9 +950,9 @@ fn chat_session(model: &LlamaModel, backend: &LlamaBackend, args: &Args) -> Resu
                         ));
                     }
                     Ok(_) => {
-                        eprintln!("no text content (page may require JavaScript)");
+                        eprintln!("no text content found");
                         ctx_block.push_str(&format!(
-                            "[Could not retrieve text content from {} (page may require JavaScript)]\n---\n",
+                            "[Could not retrieve text content from {}]\n---\n",
                             url
                         ));
                     }
